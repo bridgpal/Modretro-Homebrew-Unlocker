@@ -1,0 +1,6 @@
+# Ignore compiled/patched executables
+*.exe
+
+# Python cache
+__pycache__/
+*.py[cod]
