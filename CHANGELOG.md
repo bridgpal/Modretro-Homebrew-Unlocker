@@ -4,15 +4,32 @@ All notable changes to MRUpdater Homebrew Patcher are documented here.
 
 ---
 
-## [0.5.1] — 2026-04-27
+## [Unreleased]
 
 ### Added
-- **Tkinter GUI** — run `patch_mrupdater.py` with no arguments to open the graphical interface instead of using the command line.
-- **Browse dialogs** — file pickers for both input (`MRUpdater.exe`) and output (patched exe).
-- **Indeterminate progress bar** — animates while patching is in progress.
-- **Status label** — live feedback ("Ready.", "Patching…", "Done!", or an error message).
-- **About section** — brief description and 3-step instructions displayed at the top of the window.
-- **Disclaimer** — personal/educational-use notice displayed at the bottom of the window.
+- macOS `.app` support through the existing script, including copying the bundle, applying both HOMEBREW patches, local ad-hoc signing, and signature verification.
+- A macOS patch path that preserves Mach-O and archive offsets by keeping the patched module inside its original compressed allocation.
+- Support for thin Apple Silicon and Intel executables containing the matching Python 3.10 bytecode. Verified against the Apple Silicon v1.7.5 app; cartridge flashing remains untested.
+- Explicit rejection of universal executables, unsupported bytecode versions, compressed outer PYZ archives, and patches that would exceed their allocation.
+- Synthetic archive, app-output safety, signing-failure cleanup, and Windows CLI regression tests.
+
+### Changed
+- Command-line mode works without Tkinter and supports `--help`.
+- GUI input/output labels and file filters support macOS apps.
+- Existing output paths and in-place patching are rejected to preserve originals and previous outputs.
+- Default output naming supports Python 3.8 as documented.
+
+---
+
+## [0.5.1] - 2026-04-27
+
+### Added
+- **Tkinter GUI**: run `patch_mrupdater.py` with no arguments to open the graphical interface instead of using the command line.
+- **Browse dialogs**: file pickers for both input (`MRUpdater.exe`) and output (patched exe).
+- **Indeterminate progress bar**: animates while patching is in progress.
+- **Status label**: live feedback ("Ready.", "Patching…", "Done!", or an error message).
+- **About section**: brief description and 3-step instructions displayed at the top of the window.
+- **Disclaimer**: personal/educational-use notice displayed at the bottom of the window.
 - Output path auto-populated from input selection (defaults to `MRUpdater_homebrew.exe` in the same folder).
 
 ### Changed
@@ -20,7 +37,7 @@ All notable changes to MRUpdater Homebrew Patcher are documented here.
 
 ---
 
-## [0.0.1] — Initial release
+## [0.0.1] - Initial release
 
 ### Added
 - Command-line patcher targeting `cartclinic.gui` inside the PyInstaller CArchive / PYZ bundle.
@@ -30,4 +47,4 @@ All notable changes to MRUpdater Homebrew Patcher are documented here.
 - Handles zlib-compressed PYZ entries.
 - Correctly rebuilds the CArchive TOC and cookie when the patched PYZ changes size.
 - Outputs a new exe (`MRUpdater_homebrew.exe`) without modifying the original.
-- Pure standard-library implementation — no third-party dependencies.
+- Pure standard-library implementation: no third-party dependencies.

@@ -6,6 +6,8 @@ the developer_mode feature gate in cartclinic/gui.pyc inside PYZ.pyz.
 
 Usage:  python patch_mrupdater.py MRUpdater.exe
 Output: MRUpdater_homebrew.exe (same directory)
+macOS:  python3 patch_mrupdater.py /Applications/ChromaticFirmwareUpdater.app
+Output: ChromaticFirmwareUpdater_homebrew.app (same directory, locally signed)
 
 How it works:
   - Inside MRUpdater.exe is a PyInstaller CArchive (PKG).
@@ -17,14 +19,25 @@ How it works:
   - The 8-byte patch: 7c006a2690017222 -> 7c006a2609000100
 """
 
+from __future__ import annotations
+
+import argparse
+import plistlib
+import shutil
 import struct
+import subprocess
+import tempfile
 import zlib
 import marshal
 import sys
 import threading
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+except ImportError:
+    # Command-line patching does not require a Python build with Tk support.
+    tk = ttk = filedialog = messagebox = None
 
 # ──────────────────────────────────────────────
 # 1.  CArchive (outer PKG) constants
@@ -61,6 +74,11 @@ PATCHES = [
     ),
 ]
 TARGET_MODULE = "cartclinic.gui"
+PYTHON310_MAGIC = bytes.fromhex("6f0d0d0a")
+MACHO64_MAGIC = bytes.fromhex("cffaedfe")
+FAT_MAGICS = {bytes.fromhex(value) for value in (
+    "cafebabe", "bebafeca", "cafebabf", "bfbafeca",
+)}
 
 
 # ──────────────────────────────────────────────
@@ -331,7 +349,7 @@ def rebuild_carchive(exe_data: bytes, overlay_pos: int, toc_entries: list,
 # Main patcher
 # ──────────────────────────────────────────────
 
-def patch(input_path: str, output_path: str):
+def patch_executable(input_path: str, output_path: str):
     print(f"Reading {input_path}...")
     with open(input_path, "rb") as f:
         exe_data = f.read()
@@ -436,11 +454,178 @@ def patch(input_path: str, output_path: str):
 
     # 11. Write output
     print(f"\n[11] Writing {output_path}...")
-    with open(output_path, "wb") as f:
+    with open(output_path, "xb") as f:
         f.write(new_exe)
     print("  Done!")
     print(f"\nPatched executable: {output_path}")
     print("The HOMEBREW button in Cart Clinic is now enabled.")
+
+
+# ──────────────────────────────────────────────
+# macOS app bundles
+# ──────────────────────────────────────────────
+
+def macho_module(data: bytes):
+    """Locate the module without changing the Mach-O or archive layout."""
+    if data[:4] in FAT_MAGICS:
+        raise ValueError("Universal macOS executables are not supported; use a thin build")
+    if data[:4] != MACHO64_MAGIC or len(data) < 32:
+        raise ValueError("Expected a 64-bit Intel or Apple Silicon Mach-O executable")
+    cpu_type = struct.unpack_from("<I", data, 4)[0]
+    if cpu_type not in (0x01000007, 0x0100000C):
+        raise ValueError("Unsupported Mach-O architecture")
+    cookie = find_cookie(data)
+    if cookie + PYINST21_COOKIE_SIZE > len(data):
+        raise ValueError("Expected a PyInstaller 2.1+ archive")
+    _, pkg_size, toc_offset, toc_size, pyver, _ = struct.unpack_from(
+        "!8sIIii64s", data, cookie
+    )
+    if pyver != 310:
+        raise ValueError("The macOS bytecode patches require Python 3.10")
+    overlay = cookie + PYINST21_COOKIE_SIZE - pkg_size
+    toc_start = overlay + toc_offset
+    if not (32 <= overlay <= toc_start < toc_start + toc_size <= cookie):
+        raise ValueError("Invalid CArchive bounds")
+    # Validate table boundaries before using the shared Windows archive reader.
+    position = toc_start
+    while position < toc_start + toc_size:
+        if position + 18 > toc_start + toc_size:
+            raise ValueError("Truncated CArchive table entry")
+        entry_size = struct.unpack_from("!i", data, position)[0]
+        if entry_size < 18 or position + entry_size > toc_start + toc_size:
+            raise ValueError("Invalid CArchive table entry")
+        position += entry_size
+    entries = parse_toc(data, toc_start, toc_size, overlay)
+    pyz_entries = [entry for entry in entries if entry[4] in (b"z", b"Z")]
+    if len(pyz_entries) != 1:
+        raise ValueError("Expected exactly one PYZ archive")
+    pyz_offset, pyz_size, _, flag, _, _ = pyz_entries[0]
+    if flag != 0:
+        raise ValueError("Compressed outer PYZ archives are not supported on macOS")
+    if not (overlay <= pyz_offset < pyz_offset + pyz_size <= toc_start):
+        raise ValueError("Invalid PYZ bounds")
+    pyz = data[pyz_offset : pyz_offset + pyz_size]
+    if len(pyz) < 12 or pyz[:4] != PYZ_MAGIC or pyz[4:8] != PYTHON310_MAGIC:
+        raise ValueError("Expected a Python 3.10 PYZ archive")
+    pyz_toc_offset = struct.unpack_from("!i", pyz, 8)[0]
+    if not 12 <= pyz_toc_offset < len(pyz):
+        raise ValueError("Invalid PYZ table offset")
+    _, toc = parse_pyz(pyz)
+    if TARGET_MODULE not in toc:
+        raise ValueError(f"Module {TARGET_MODULE!r} not found")
+    _, module_offset, module_size = toc[TARGET_MODULE]
+    if not (12 <= module_offset < module_offset + module_size <= pyz_toc_offset):
+        raise ValueError("Invalid module bounds")
+    # The target allocation must not overlap another module's compressed data.
+    for name, (_, start, length) in toc.items():
+        if name != TARGET_MODULE and max(start, module_offset) < min(
+            start + length, module_offset + module_size
+        ):
+            raise ValueError("Overlapping PYZ modules")
+    module = extract_module(pyz, toc, TARGET_MODULE)
+    return pyz_offset + module_offset, module_size, module
+
+
+def patch_macho(data: bytes) -> bytes:
+    """Apply both patches within the existing compressed module allocation."""
+    offset, size, module = macho_module(data)
+    patched = module
+    for before, after, description in PATCHES:
+        print(f"  {description}")
+        patched = patch_module_bytes(patched, before, after)
+    compressed = min((zlib.compress(patched, level) for level in range(1, 10)), key=len)
+    if len(compressed) > size:
+        raise ValueError("Patched module does not fit its original allocation; aborting")
+    # PyInstaller uses zlib.decompress, which ignores trailing unused bytes.
+    # Padding retains every archive offset and every Mach-O load command.
+    replacement = compressed.ljust(size, b"\0")
+    result = data[:offset] + replacement + data[offset + size:]
+    if macho_module(result) != (offset, size, patched):
+        raise ValueError("Patched module verification failed")
+    print(f"  Compressed module: {len(compressed):,} bytes in {size:,}-byte allocation")
+    return result
+
+
+def patch_macos_app(input_path: Path, output_path: Path):
+    """Copy, patch, sign and verify an app before publishing the output bundle."""
+    if sys.platform != "darwin":
+        raise ValueError("macOS app bundles must be patched on a Mac (codesign required)")
+    for tool in ("ditto", "codesign"):
+        if shutil.which(tool) is None:
+            raise ValueError(f"Required macOS tool not found: {tool}")
+    if output_path.suffix.lower() != ".app":
+        raise ValueError("The macOS output path must end in .app")
+    with (input_path / "Contents" / "Info.plist").open("rb") as stream:
+        info = plistlib.load(stream)
+    executable = info.get("CFBundleExecutable")
+    if (not isinstance(executable, str) or not executable
+            or executable in (".", "..") or "/" in executable):
+        raise ValueError("Invalid CFBundleExecutable in Info.plist")
+    relative_binary = Path("Contents") / "MacOS" / executable
+    binary = input_path / relative_binary
+    if input_path not in binary.resolve().parents:
+        raise ValueError("App executable points outside its bundle")
+    original = binary.read_bytes()
+    patched = patch_macho(original)
+
+    with tempfile.TemporaryDirectory(prefix=".mrupdater-", dir=output_path.parent) as work:
+        staged = Path(work) / output_path.name
+        # ditto preserves framework symlinks, permissions and bundle metadata.
+        subprocess.run(["ditto", str(input_path), str(staged)], check=True)
+        staged_binary = staged / relative_binary
+        if staged_binary.is_symlink():
+            raise ValueError("Symlinked app executables are not supported")
+        if staged_binary.read_bytes() != original:
+            raise ValueError("Source executable changed while copying the app")
+        staged_binary.write_bytes(patched)
+        # A local ad-hoc signature replaces the invalidated vendor signature.
+        # Clear hardened-runtime flags so vendor-signed embedded libraries can
+        # load without a matching Team ID on the locally signed main executable.
+        subprocess.run([
+            "codesign", "--force", "--sign", "-", "--options", "0",
+            "--timestamp=none", str(staged),
+        ], check=True)
+        subprocess.run([
+            "codesign", "--verify", "--deep", "--strict", str(staged),
+        ], check=True)
+        if macho_module(staged_binary.read_bytes()) != macho_module(patched):
+            raise ValueError("Module changed during code signing")
+        # Reserve the destination exclusively, then replace only our empty
+        # directory. Existing files, directories and symlinks are never replaced.
+        output_path.mkdir()
+        try:
+            staged.rename(output_path)
+        except BaseException:
+            output_path.rmdir()
+            raise
+    print(f"\nPatched app: {output_path}")
+    print("Both HOMEBREW patches applied; local code signature verified.")
+    print(f"Original app unchanged: {input_path}")
+
+
+def default_output_path(input_path: str) -> Path:
+    path = Path(input_path).expanduser()
+    return path.with_name(path.stem + "_homebrew" + path.suffix)
+
+
+def patch(input_path: str, output_path: str):
+    source = Path(input_path).expanduser().resolve(strict=True)
+    destination = Path(output_path).expanduser()
+    if destination.is_symlink() or destination.exists():
+        raise ValueError("Output already exists; choose a new path to preserve existing files")
+    destination = destination.resolve()
+    if source == destination or source in destination.parents:
+        raise ValueError("Output must be separate from the original app or executable")
+    if source.is_dir() and source.suffix.lower() == ".app":
+        patch_macos_app(source, destination)
+    elif source.is_file():
+        with source.open("rb") as stream:
+            magic = stream.read(4)
+        if magic == MACHO64_MAGIC or magic in FAT_MAGICS:
+            raise ValueError("Pass the whole .app bundle on macOS, not its inner executable")
+        patch_executable(str(source), str(destination))
+    else:
+        raise ValueError("Input must be an MRUpdater executable or a macOS .app bundle")
 
 
 # ──────────────────────────────────────────────
@@ -456,9 +641,9 @@ class PatcherGUI:
         # ── Description ──
         description = (
             "Unlocks the hidden HOMEBREW button in MRUpdater's Cart Clinic.\n"
-            "1. Browse for your MRUpdater.exe.\n"
-            "2. Choose where to save the patched copy (default: MRUpdater_homebrew.exe).\n"
-            "3. Click Patch!  — your original file is never modified."
+            "1. Select MRUpdater.exe or ChromaticFirmwareUpdater.app.\n"
+            "2. Choose a new path for the patched copy.\n"
+            "3. Click Patch! Your original file is never modified."
         )
         frm_desc = ttk.LabelFrame(root, text="About", padding=8)
         frm_desc.pack(fill="x", padx=12, pady=(12, 4))
@@ -468,7 +653,7 @@ class PatcherGUI:
         frm_input = ttk.LabelFrame(root, text="Input", padding=8)
         frm_input.pack(fill="x", padx=12, pady=4)
 
-        ttk.Label(frm_input, text="MRUpdater.exe:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm_input, text="Original updater:").grid(row=0, column=0, sticky="w")
         self.input_var = tk.StringVar()
         self.input_entry = ttk.Entry(frm_input, textvariable=self.input_var, width=52)
         self.input_entry.grid(row=0, column=1, padx=(6, 4), sticky="ew")
@@ -479,7 +664,7 @@ class PatcherGUI:
         frm_output = ttk.LabelFrame(root, text="Output", padding=8)
         frm_output.pack(fill="x", padx=12, pady=4)
 
-        ttk.Label(frm_output, text="Patched exe:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm_output, text="Patched copy:").grid(row=0, column=0, sticky="w")
         self.output_var = tk.StringVar()
         self.output_entry = ttk.Entry(frm_output, textvariable=self.output_var, width=52)
         self.output_entry.grid(row=0, column=1, padx=(6, 4), sticky="ew")
@@ -511,20 +696,24 @@ class PatcherGUI:
                   foreground="#b05000").pack(anchor="center")
 
     def _browse_input(self):
+        filetypes = [("Executable", "*.exe"), ("All files", "*.*")]
+        if sys.platform == "darwin":
+            filetypes.insert(0, ("macOS application", "*.app"))
         path = filedialog.askopenfilename(
-            title="Select MRUpdater.exe",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+            title="Select original updater", filetypes=filetypes)
         if path:
             self.input_var.set(path)
             if not self.output_var.get():
-                p = Path(path)
-                self.output_var.set(str(p.with_stem(p.stem + "_homebrew")))
+                self.output_var.set(str(default_output_path(path)))
 
     def _browse_output(self):
+        is_app = Path(self.input_var.get()).suffix.lower() == ".app"
+        extension = ".app" if is_app else ".exe"
+        filetype = "macOS application" if is_app else "Executable"
         path = filedialog.asksaveasfilename(
-            title="Save patched exe as",
-            defaultextension=".exe",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+            title="Save patched copy as",
+            defaultextension=extension,
+            filetypes=[(filetype, "*" + extension), ("All files", "*.*")])
         if path:
             self.output_var.set(path)
 
@@ -533,7 +722,7 @@ class PatcherGUI:
         out = self.output_var.get().strip()
 
         if not inp:
-            messagebox.showwarning("Missing input", "Please select the input MRUpdater.exe.")
+            messagebox.showwarning("Missing input", "Please select the original updater.")
             return
         if not out:
             messagebox.showwarning("Missing output", "Please specify the output path.")
@@ -569,17 +758,25 @@ class PatcherGUI:
         messagebox.showerror("Patch failed", msg)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
+def main():
+    parser = argparse.ArgumentParser(description="Unlock MRUpdater's HOMEBREW button")
+    parser.add_argument("input", nargs="?", help="MRUpdater.exe or a macOS .app bundle")
+    parser.add_argument("output", nargs="?", help="New output path (default: *_homebrew)")
+    args = parser.parse_args()
+    if args.input is None:
+        if tk is None:
+            parser.error("GUI requires tkinter; pass an input path to use command-line mode")
         root = tk.Tk()
         PatcherGUI(root)
         root.mainloop()
     else:
-        inp = sys.argv[1]
-        if len(sys.argv) >= 3:
-            out = sys.argv[2]
-        else:
-            p = Path(inp)
-            out = str(p.with_stem(p.stem + "_homebrew"))
-        patch(inp, out)
+        try:
+            patch(args.input, args.output or str(default_output_path(args.input)))
+        except (OSError, ValueError, KeyError, EOFError, struct.error,
+                zlib.error, subprocess.CalledProcessError) as exc:
+            parser.exit(1, f"Patch failed: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()
 

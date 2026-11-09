@@ -1,5 +1,6 @@
 # Ignore compiled/patched executables
 *.exe
+*.app/
 
 # Python cache
 __pycache__/
